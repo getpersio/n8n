@@ -89,8 +89,10 @@ import { INodeParameters, INodeProperties, INodePropertyMode, IParameterLabel } 
 import { BaseTextKey } from '@/plugins/i18n';
 import { mapStores } from 'pinia';
 import { useNDVStore } from '@/stores/ndv';
+import { useSegment } from '@/stores/segment';
+import { externalHooks } from '@/mixins/externalHooks';
 
-export default mixins(showMessage).extend({
+export default mixins(showMessage, externalHooks).extend({
 	name: 'parameter-input-full',
 	components: {
 		ParameterOptions,
@@ -326,6 +328,9 @@ export default mixins(showMessage).extend({
 							hasExpressionMapping(prevValue),
 						success: true,
 					});
+
+					const segment = useSegment();
+					segment.track(segment.EVENTS.MAPPED_DATA);
 				}
 				this.forceShowExpression = false;
 			}, 200);

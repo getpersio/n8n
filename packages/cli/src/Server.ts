@@ -10,7 +10,7 @@
 /* eslint-disable @typescript-eslint/no-unused-vars */
 /* eslint-disable @typescript-eslint/no-unsafe-member-access */
 /* eslint-disable @typescript-eslint/no-unsafe-assignment */
-
+import assert from 'assert';
 import { exec as callbackExec } from 'child_process';
 import { access as fsAccess } from 'fs/promises';
 import os from 'os';
@@ -19,6 +19,7 @@ import { createHmac } from 'crypto';
 import { promisify } from 'util';
 import cookieParser from 'cookie-parser';
 import express from 'express';
+import { engine as expressHandlebars } from 'express-handlebars';
 import type { ServeStaticOptions } from 'serve-static';
 import type { FindManyOptions } from 'typeorm';
 import { Not, In } from 'typeorm';
@@ -48,6 +49,7 @@ import type {
 	ICredentialTypes,
 	ExecutionStatus,
 	IExecutionsSummary,
+	IN8nUISettings,
 } from 'n8n-workflow';
 import { LoggerProxy, jsonParse } from 'n8n-workflow';
 
@@ -56,7 +58,7 @@ import timezones from 'google-timezones-json';
 import history from 'connect-history-api-fallback';
 
 import config from '@/config';
-import * as Queue from '@/Queue';
+import { Queue } from '@/Queue';
 import { getSharedWorkflowIds } from '@/WorkflowHelpers';
 
 import { workflowsController } from '@/workflows/workflows.controller';
@@ -103,7 +105,7 @@ import {
 	isUserManagementEnabled,
 	whereClause,
 } from '@/UserManagement/UserManagementHelper';
-import { getInstance as getMailerInstance } from '@/UserManagement/email';
+import { UserManagementMailer } from '@/UserManagement/email';
 import * as Db from '@/Db';
 import type {
 	ICredentialsDb,
@@ -111,7 +113,6 @@ import type {
 	IDiagnosticInfo,
 	IExecutionFlattedDb,
 	IExecutionsStopData,
-	IN8nUISettings,
 } from '@/Interfaces';
 import { ActiveExecutions } from '@/ActiveExecutions';
 import {
@@ -128,7 +129,7 @@ import { WaitTracker } from '@/WaitTracker';
 import * as WebhookHelpers from '@/WebhookHelpers';
 import * as WorkflowExecuteAdditionalData from '@/WorkflowExecuteAdditionalData';
 import { toHttpNodeParameters } from '@/CurlConverterHelper';
-import { eventBusRouter } from '@/eventbus/eventBusRoutes';
+import { EventBusController } from '@/eventbus/eventBus.controller';
 import { isLogStreamingEnabled } from '@/eventbus/MessageEventBus/MessageEventBusHelper';
 import { licenseController } from './license/license.controller';
 import { Push, setupPushServer, setupPushHandler } from '@/push';
@@ -155,7 +156,17 @@ import {
 import { getSamlLoginLabel, isSamlLoginEnabled, isSamlLicensed } from './sso/saml/samlHelpers';
 import { SamlController } from './sso/saml/routes/saml.controller.ee';
 import { SamlService } from './sso/saml/saml.service.ee';
+import { variablesController } from './environments/variables/variables.controller';
 import { LdapManager } from './Ldap/LdapManager.ee';
+import { getVariablesLimit, isVariablesEnabled } from '@/environments/variables/enviromentHelpers';
+import {
+	getCurrentAuthenticationMethod,
+	isLdapCurrentAuthenticationMethod,
+	isSamlCurrentAuthenticationMethod,
+} from './sso/ssoHelpers';
+import { isVersionControlLicensed } from '@/environments/versionControl/versionControlHelper';
+import { VersionControlService } from '@/environments/versionControl/versionControl.service.ee';
+import { VersionControlController } from '@/environments/versionControl/versionControl.controller.ee';
 
 const exec = promisify(callbackExec);
 
@@ -182,6 +193,10 @@ class Server extends AbstractServer {
 
 	constructor() {
 		super();
+
+		this.app.engine('handlebars', expressHandlebars({ defaultLayout: false }));
+		this.app.set('view engine', 'handlebars');
+		this.app.set('views', TEMPLATES_DIR);
 
 		this.loadNodesAndCredentials = Container.get(LoadNodesAndCredentials);
 		this.credentialTypes = Container.get(CredentialTypes);
@@ -256,6 +271,8 @@ class Server extends AbstractServer {
 			},
 			personalizationSurveyEnabled:
 				config.getEnv('personalization.enabled') && config.getEnv('diagnostics.enabled'),
+			userActivationSurveyEnabled:
+				config.getEnv('userActivationSurvey.enabled') && config.getEnv('diagnostics.enabled'),
 			defaultLocale: config.getEnv('defaultLocale'),
 			userManagement: {
 				enabled: isUserManagementEnabled(),
@@ -264,6 +281,7 @@ class Server extends AbstractServer {
 					config.getEnv('userManagement.isInstanceOwnerSetUp') === false &&
 					config.getEnv('userManagement.skipInstanceOwnerSetup') === false,
 				smtpSetup: isEmailSetUp(),
+				authenticationMethod: getCurrentAuthenticationMethod(),
 			},
 			sso: {
 				saml: {
@@ -299,19 +317,24 @@ class Server extends AbstractServer {
 			},
 			isNpmAvailable: false,
 			allowedModules: {
-				builtIn: process.env.NODE_FUNCTION_ALLOW_BUILTIN,
-				external: process.env.NODE_FUNCTION_ALLOW_EXTERNAL,
+				builtIn: process.env.NODE_FUNCTION_ALLOW_BUILTIN?.split(',') ?? undefined,
+				external: process.env.NODE_FUNCTION_ALLOW_EXTERNAL?.split(',') ?? undefined,
 			},
 			enterprise: {
 				sharing: false,
 				ldap: false,
 				saml: false,
-				logStreaming: config.getEnv('enterprise.features.logStreaming'),
-				advancedExecutionFilters: config.getEnv('enterprise.features.advancedExecutionFilters'),
+				logStreaming: false,
+				advancedExecutionFilters: false,
+				variables: false,
+				versionControl: false,
 			},
 			hideUsagePage: config.getEnv('hideUsagePage'),
 			license: {
 				environment: config.getEnv('license.tenantId') === 1 ? 'production' : 'staging',
+			},
+			variables: {
+				limit: 0,
 			},
 		};
 	}
@@ -323,6 +346,7 @@ class Server extends AbstractServer {
 		// refresh user management status
 		Object.assign(this.frontendSettings.userManagement, {
 			enabled: isUserManagementEnabled(),
+			authenticationMethod: getCurrentAuthenticationMethod(),
 			showSetupOnFirstLoad:
 				config.getEnv('userManagement.disabled') === false &&
 				config.getEnv('userManagement.isInstanceOwnerSetUp') === false &&
@@ -337,6 +361,8 @@ class Server extends AbstractServer {
 			ldap: isLdapEnabled(),
 			saml: isSamlLicensed(),
 			advancedExecutionFilters: isAdvancedExecutionFiltersEnabled(),
+			variables: isVariablesEnabled(),
+			versionControl: isVersionControlLicensed(),
 		});
 
 		if (isLdapEnabled()) {
@@ -353,10 +379,13 @@ class Server extends AbstractServer {
 			});
 		}
 
+		if (isVariablesEnabled()) {
+			this.frontendSettings.variables.limit = getVariablesLimit();
+		}
+
 		if (config.get('nodes.packagesMissing').length > 0) {
 			this.frontendSettings.missingPackages = true;
 		}
-
 		return this.frontendSettings;
 	}
 
@@ -367,16 +396,25 @@ class Server extends AbstractServer {
 
 		const logger = LoggerProxy;
 		const internalHooks = Container.get(InternalHooks);
-		const mailer = getMailerInstance();
+		const mailer = Container.get(UserManagementMailer);
 		const postHog = this.postHog;
-		const samlService = SamlService.getInstance();
+		const samlService = Container.get(SamlService);
+		const versionControlService = Container.get(VersionControlService);
 
 		const controllers: object[] = [
+			new EventBusController(),
 			new AuthController({ config, internalHooks, repositories, logger, postHog }),
 			new OwnerController({ config, internalHooks, repositories, logger }),
 			new MeController({ externalHooks, internalHooks, repositories, logger }),
 			new NodeTypesController({ config, nodeTypes }),
-			new PasswordResetController({ config, externalHooks, internalHooks, repositories, logger }),
+			new PasswordResetController({
+				config,
+				externalHooks,
+				internalHooks,
+				mailer,
+				repositories,
+				logger,
+			}),
 			new TagsController({ config, repositories, externalHooks }),
 			new TranslationController(config, this.credentialTypes),
 			new UsersController({
@@ -390,6 +428,7 @@ class Server extends AbstractServer {
 				postHog,
 			}),
 			new SamlController(samlService),
+			new VersionControlController(versionControlService),
 		];
 
 		if (isLdapEnabled()) {
@@ -409,13 +448,15 @@ class Server extends AbstractServer {
 	async configure(): Promise<void> {
 		configureMetrics(this.app);
 
+		this.instanceId = await UserSettings.getInstanceId();
+
 		this.frontendSettings.isNpmAvailable = await exec('npm --version')
 			.then(() => true)
 			.catch(() => false);
 
 		this.frontendSettings.versionCli = N8N_VERSION;
 
-		this.frontendSettings.instanceId = await UserSettings.getInstanceId();
+		this.frontendSettings.instanceId = this.instanceId;
 
 		await this.externalHooks.run('frontend.settings', [this.frontendSettings]);
 
@@ -428,8 +469,6 @@ class Server extends AbstractServer {
 			'assets',
 			'healthz',
 			'metrics',
-			'icons',
-			'types',
 			'e2e',
 			this.endpointWebhook,
 			this.endpointWebhookTest,
@@ -437,6 +476,11 @@ class Server extends AbstractServer {
 			config.getEnv('publicApi.disabled') ? publicApiEndpoint : '',
 			...excludeEndpoints.split(':'),
 		].filter((u) => !!u);
+
+		assert(
+			!ignoredEndpoints.includes(this.restEndpoint),
+			`REST endpoint cannot be set to any of these values: ${ignoredEndpoints.join()} `,
+		);
 
 		// eslint-disable-next-line no-useless-escape
 		const authIgnoreRegex = new RegExp(`^\/(${ignoredEndpoints.join('|')})\/?.*$`);
@@ -480,6 +524,10 @@ class Server extends AbstractServer {
 			}),
 		);
 
+		if (config.getEnv('executions.mode') === 'queue') {
+			await Container.get(Queue).init();
+		}
+
 		await handleLdapInit();
 
 		this.registerControllers(ignoredEndpoints);
@@ -507,15 +555,32 @@ class Server extends AbstractServer {
 
 		// initialize SamlService if it is licensed, even if not enabled, to
 		// set up the initial environment
-		if (isSamlLicensed()) {
-			try {
-				await SamlService.getInstance().init();
-			} catch (error) {
-				LoggerProxy.error(`SAML initialization failed: ${error.message}`);
-			}
+		try {
+			await Container.get(SamlService).init();
+		} catch (error) {
+			LoggerProxy.warn(`SAML initialization failed: ${error.message}`);
 		}
 
 		// ----------------------------------------
+		// Variables
+		// ----------------------------------------
+
+		this.app.use(`/${this.restEndpoint}/variables`, variablesController);
+
+		// ----------------------------------------
+		// Version Control
+		// ----------------------------------------
+
+		// initialize SamlService if it is licensed, even if not enabled, to
+		// set up the initial environment
+		try {
+			await Container.get(VersionControlService).init();
+		} catch (error) {
+			LoggerProxy.warn(`Version Control initialization failed: ${error.message}`);
+		}
+
+		// ----------------------------------------
+
 		// Returns parameter values which normally get loaded from an external API or
 		// get generated dynamically
 		this.app.get(
@@ -953,7 +1018,7 @@ class Server extends AbstractServer {
 			ResponseHelper.send(
 				async (req: ExecutionRequest.GetAllCurrent): Promise<IExecutionsSummary[]> => {
 					if (config.getEnv('executions.mode') === 'queue') {
-						const queue = await Queue.getInstance();
+						const queue = Container.get(Queue);
 						const currentJobs = await queue.getJobs(['active', 'waiting']);
 
 						const currentlyRunningQueueIds = currentJobs.map((job) => job.data.executionId);
@@ -1096,7 +1161,7 @@ class Server extends AbstractServer {
 						} as IExecutionsStopData;
 					}
 
-					const queue = await Queue.getInstance();
+					const queue = Container.get(Queue);
 					const currentJobs = await queue.getJobs(['active', 'waiting']);
 
 					const job = currentJobs.find((job) => job.data.executionId === req.params.id);
@@ -1215,8 +1280,6 @@ class Server extends AbstractServer {
 		if (!eventBus.isInitialized) {
 			await eventBus.initialize();
 		}
-		// add Event Bus REST endpoints
-		this.app.use(`/${this.restEndpoint}/eventbus`, eventBusRouter);
 
 		// ----------------------------------------
 		// Webhooks
@@ -1360,7 +1423,8 @@ export async function start(): Promise<void> {
 		binaryDataMode: binaryDataConfig.mode,
 		n8n_multi_user_allowed: isUserManagementEnabled(),
 		smtp_set_up: config.getEnv('userManagement.emails.mode') === 'smtp',
-		ldap_allowed: isLdapEnabled(),
+		ldap_allowed: isLdapCurrentAuthenticationMethod(),
+		saml_enabled: isSamlCurrentAuthenticationMethod(),
 	};
 
 	// Set up event handling
